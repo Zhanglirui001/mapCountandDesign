@@ -1,0 +1,39 @@
+[project]
+name = "count-and-design"
+dynamic = ["version"]
+description = "Data model layer for Count and Design."
+requires-python = ">=3.11"
+dependencies = [
+    "pyside6>=6.8",
+    "openpyxl>=3.1",
+    "requests>=2.31",
+    "ortools>=9.14",
+    "pillow>=12.3.0",
+    "pypdfium2>=5.12.1",
+    "ultralytics>=8.3.0",
+    "onnxruntime>=1.20.0",
+    "onnx>=1.17.0",
+    "lap>=0.5.12",
+    "opencv-python-headless>=4.8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.20,<2"]
+
+[tool.hatch.version]
+path = "src/count_and_design/__init__.py"
+pattern = "__version__ = ['\"](?P<version>[^'\"]+)['\"]"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/count_and_design"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pyinstaller>=6.0",
+    "pytest-xdist>=3.8.0",
+]

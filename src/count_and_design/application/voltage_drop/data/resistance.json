@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "unit": "ohm_per_kft",
+  "entries": [
+    {"wire_size": "14AWG", "material": "Al", "ohms_per_kft": 5.425915},
+    {"wire_size": "10AWG", "material": "Al", "ohms_per_kft": 2.14098},
+    {"wire_size": "8AWG", "material": "Al", "ohms_per_kft": 1.34336},
+    {"wire_size": "6AWG", "material": "Al", "ohms_per_kft": 0.847996},
+    {"wire_size": "4AWG", "material": "Al", "ohms_per_kft": 0.533146},
+    {"wire_size": "2AWG", "material": "Al", "ohms_per_kft": 0.3347905},
+    {"wire_size": "1AWG", "material": "Al", "ohms_per_kft": 0.2655235},
+    {"wire_size": "1/0AWG", "material": "Al", "ohms_per_kft": 0.2109495},
+    {"wire_size": "2/0AWG", "material": "Al", "ohms_per_kft": 0.1668705},
+    {"wire_size": "3/0AWG", "material": "Al", "ohms_per_kft": 0.132237},
+    {"wire_size": "4/0AWG", "material": "Al", "ohms_per_kft": 0.10495},
+    {"wire_size": "300MCM", "material": "Al", "ohms_per_kft": 0.07419965},
+    {"wire_size": "350MCM", "material": "Al", "ohms_per_kft": 0.06349475},
+    {"wire_size": "400MCM", "material": "Al", "ohms_per_kft": 0.05551855},
+    {"wire_size": "500MCM", "material": "Al", "ohms_per_kft": 0.0444988},
+    {"wire_size": "600MCM", "material": "Al", "ohms_per_kft": 0.03704735},
+    {"wire_size": "750MCM", "material": "Al", "ohms_per_kft": 0.0295959},
+    {"wire_size": "1000MCM", "material": "Al", "ohms_per_kft": 0.0222494},
+
+    {"wire_size": "14AWG", "material": "Cu", "ohms_per_kft": 3.292133},
+    {"wire_size": "12AWG", "material": "Cu", "ohms_per_kft": 2.075931},
+    {"wire_size": "10AWG", "material": "Cu", "ohms_per_kft": 1.300078},
+    {"wire_size": "8AWG", "material": "Cu", "ohms_per_kft": 0.8156941},
+    {"wire_size": "6AWG", "material": "Cu", "ohms_per_kft": 0.51478895},
+    {"wire_size": "4AWG", "material": "Cu", "ohms_per_kft": 0.3229226},
+    {"wire_size": "2AWG", "material": "Cu", "ohms_per_kft": 0.2033993},
+    {"wire_size": "1AWG", "material": "Cu", "ohms_per_kft": 0.1614613},
+    {"wire_size": "1/0AWG", "material": "Cu", "ohms_per_kft": 0.1279109},
+    {"wire_size": "2/0AWG", "material": "Cu", "ohms_per_kft": 0.101385115},
+    {"wire_size": "3/0AWG", "material": "Cu", "ohms_per_kft": 0.08031127},
+    {"wire_size": "4/0AWG", "material": "Cu", "ohms_per_kft": 0.06374576},
+    {"wire_size": "350MCM", "material": "Cu", "ohms_per_kft": 0.038478115}
+  ]
+}

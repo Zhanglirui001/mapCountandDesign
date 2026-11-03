@@ -1,0 +1,7 @@
+# Replace command with the absolute path of the installed executable.
+# Replace the existing count-and-design table, including its old .env subtable.
+[mcp_servers.count-and-design]
+command = 'C:\Data\2D_design\count-and-design\dist\Count and Design v1.7.10.exe'
+args = ['--mcp']
+startup_timeout_sec = 120
+tool_timeout_sec = 180

@@ -1,0 +1,273 @@
+stages:
+  - version
+  - build
+
+variables:
+  UV_VERSION: "0.11.23"
+  GIT_DEPTH: 0
+  # GITLAB_API_TOKEN — Create a Project Access Token with ``api`` scope.
+  #   Override in: Settings → CI/CD → Variables (takes precedence over this default).
+  GITLAB_API_TOKEN: ""
+  # UPDATER_VERIFY_SSL — set to "false" for intranet self-signed certs.
+  UPDATER_VERIFY_SSL: "true"
+  # Runner-host .env copied into the workspace before PyInstaller bundles it.
+  RUNNER_ENV_FILE: "C:\\GitLab-Runner\\config\\count-and-design\\.env"
+
+# Copy the runner-host .env into the repo root for PyInstaller (count_and_design.spec).
+.copy-runner-env:
+  script:
+    - |
+      $envFile = "$env:RUNNER_ENV_FILE"
+      if (-not (Test-Path $envFile)) {
+        Write-Error "FATAL: Runner .env not found at: $envFile"
+        Write-Error "On the runner host, create the file, e.g.:"
+        Write-Error "  New-Item -ItemType Directory -Force C:\GitLab-Runner\config\count-and-design"
+        Write-Error "  Copy-Item .env C:\GitLab-Runner\config\count-and-design\.env"
+        exit 1
+      }
+      Copy-Item -Force $envFile "$CI_PROJECT_DIR\.env"
+      Write-Host "[OK] Copied $envFile -> $CI_PROJECT_DIR\.env"
+
+# ============================================================
+# Stage 1: Auto-version — 自动版本管理（仅 master 分支）
+#           纯 Python 实现，零外部依赖，替代 release-please
+# ============================================================
+auto-version:
+  stage: version
+  tags: [windows]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master"
+  script:
+    # Configure git identity for automatic commit & push
+    - git config user.email "ci@gitlab"
+    - git config user.name "GitLab CI"
+    # Run the version manager (Python stdlib only, no extra deps)
+    # Requires GITLAB_API_TOKEN set in Settings → CI/CD → Variables
+    - python version_manager.py
+
+# ============================================================
+# Stage 2a: Build Release EXE — 正式版本（tag pipeline）
+#            auto-version 创建 tag 后自动触发
+# ============================================================
+build-release:
+  stage: build
+  tags: [windows]
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/
+  script:
+    - cd $CI_PROJECT_DIR
+    # Clean
+    - |
+      @('dist', 'build', '.venv') | ForEach-Object { if (Test-Path $_) { Remove-Item -Recurse -Force $_ -ErrorAction SilentlyContinue } }
+    - Get-ChildItem -Recurse -Directory -Filter __pycache__ -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue 2>$null
+    - Write-Host "Workspace cleaned."
+
+    # Install uv
+    - pip install uv==$UV_VERSION
+
+    # Install dependencies
+    - uv sync --frozen --extra mcp
+
+    # Inject updater configuration
+    - python inject_updater.py src/count_and_design/application/updater.py "$CI_PROJECT_PATH" "$CI_API_V4_URL" "$GITLAB_API_TOKEN" "$UPDATER_VERIFY_SSL"
+
+    # Copy runner-host .env into workspace before PyInstaller bundles it
+    - !reference [.copy-runner-env, script]
+
+    # Build EXE
+    - uv run pyinstaller count_and_design.spec --clean
+
+    # Upload EXE to Generic Package Registry
+    - |
+      $exe = Get-ChildItem "dist/Count and Design*.exe" | Select-Object -First 1
+      if (-not $exe) {
+        Write-Error "No EXE found in dist/"
+        exit 1
+      }
+      $safeName = $exe.Name -replace '\s+', '_'
+      $encodedName = [uri]::EscapeDataString($safeName)
+      $pkgUrl = "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/count-and-design/$CI_COMMIT_TAG/$encodedName"
+      Write-Host "Uploading $($exe.Name) to Generic Package Registry..."
+      Invoke-RestMethod -Uri $pkgUrl -Method Put `
+        -Headers @{"PRIVATE-TOKEN" = "$GITLAB_API_TOKEN"} `
+        -InFile $exe.FullName
+
+    # Add asset link to the release created by auto-version
+    - |
+      $exe = Get-ChildItem "dist/Count and Design*.exe" | Select-Object -First 1
+      $safeName = $exe.Name -replace '\s+', '_'
+      $encodedName = [uri]::EscapeDataString($safeName)
+      $downloadUrl = "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/count-and-design/$CI_COMMIT_TAG/$encodedName"
+      $linkBody = @{
+        name = $exe.Name
+        url = $downloadUrl
+        link_type = "package"
+      } | ConvertTo-Json
+      Write-Host "Adding asset link to release $CI_COMMIT_TAG..."
+      Invoke-RestMethod -Uri "$CI_API_V4_URL/projects/$CI_PROJECT_ID/releases/$CI_COMMIT_TAG/assets/links" `
+        -Method Post `
+        -Headers @{"PRIVATE-TOKEN" = "$GITLAB_API_TOKEN"; "Content-Type" = "application/json"} `
+        -Body $linkBody
+
+    - Write-Host "Release build complete."
+
+# ============================================================
+# Stage 2b: Shared test-release build template
+#            dev 与 v1.0-SIT 使用不同的 job、tag 和清理范围
+# ============================================================
+.build-test-release:
+  stage: build
+  tags: [windows]
+  script:
+    - cd $CI_PROJECT_DIR
+    # Generate a channel-specific tag and a PEP 440-compatible build version
+    - |
+      $initFile = "src/count_and_design/__init__.py"
+      $current = (Select-String -Path $initFile -Pattern '__version__\s*=\s*"([^"]+)"').Matches.Groups[1].Value
+      $date = (Get-Date).ToUniversalTime().ToString("yyyyMMdd")
+      $time = (Get-Date).ToUniversalTime().ToString("HHmmss")
+      $releaseTag = "v${date}.${time}${RELEASE_TAG_SUFFIX}"
+      $buildVersion = "${date}.${time}${BUILD_VERSION_SUFFIX}"
+      Write-Host "Current release version: $current"
+      Write-Host "$RELEASE_KIND tag: $releaseTag"
+      Write-Host "$RELEASE_KIND build version: $buildVersion"
+      (Get-Content $initFile) -replace '__version__\s*=\s*"[^"]*"', "__version__ = `"$buildVersion`"" | Set-Content $initFile
+      Write-Host "Injected version into __init__.py:"
+      Select-String -Path $initFile -Pattern '__version__'
+
+    # Clean
+    - |
+      @('dist', 'build', '.venv') | ForEach-Object { if (Test-Path $_) { Remove-Item -Recurse -Force $_ -ErrorAction SilentlyContinue } }
+    - Get-ChildItem -Recurse -Directory -Filter __pycache__ -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue 2>$null
+    - Write-Host "Workspace cleaned."
+
+    # Install uv
+    - pip install uv==$UV_VERSION
+
+    # Install dependencies
+    - uv sync --frozen --extra mcp
+
+    # Inject updater configuration
+    - python inject_updater.py src/count_and_design/application/updater.py "$CI_PROJECT_PATH" "$CI_API_V4_URL" "$GITLAB_API_TOKEN" "$UPDATER_VERIFY_SSL"
+
+    # Copy runner-host .env into workspace before PyInstaller bundles it
+    - !reference [.copy-runner-env, script]
+
+    # Build EXE
+    - uv run pyinstaller count_and_design.spec --clean
+
+    # Create GitLab Release (which also creates the tag)
+    - |
+      $body = "| Item | Value |`n|------|-------|`n| Test Version | $releaseTag |`n| Based On | $current |`n| Branch | $CI_COMMIT_BRANCH |`n| Commit | $CI_COMMIT_SHA |`n`n> **NOTE:** This is an auto-generated test release. It may contain unfinished features and unknown bugs."
+      $releaseBody = @{
+        tag_name = $releaseTag
+        ref = "$CI_COMMIT_SHA"
+        name = "$RELEASE_KIND $releaseTag"
+        description = $body
+      } | ConvertTo-Json
+      $releaseUrl = "$CI_API_V4_URL/projects/$CI_PROJECT_ID/releases"
+      Write-Host "[DEBUG] API_URL: $CI_API_V4_URL"
+      Write-Host "[DEBUG] PROJECT_ID: $CI_PROJECT_ID"
+      Write-Host "[DEBUG] Release URL: $releaseUrl"
+      Write-Host "[DEBUG] Token length: $($GITLAB_API_TOKEN.Length)"
+      if ([string]::IsNullOrEmpty($GITLAB_API_TOKEN)) {
+        Write-Error "FATAL: GITLAB_API_TOKEN is empty. Set it in Settings -> CI/CD -> Variables."
+        exit 1
+      }
+      Write-Host "Creating GitLab Release for $RELEASE_KIND..."
+      Invoke-RestMethod -Uri $releaseUrl `
+        -Method Post `
+        -Headers @{"PRIVATE-TOKEN" = "$GITLAB_API_TOKEN"; "Content-Type" = "application/json"} `
+        -Body $releaseBody
+
+    # Upload EXE to Generic Package Registry
+    - |
+      $exe = Get-ChildItem "dist/Count and Design*.exe" | Select-Object -First 1
+      if (-not $exe) {
+        Write-Error "No EXE found in dist/"
+        exit 1
+      }
+      $safeName = $exe.Name -replace '\s+', '_'
+      $encodedName = [uri]::EscapeDataString($safeName)
+      $pkgUrl = "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/count-and-design/$releaseTag/$encodedName"
+      Write-Host "Uploading $($exe.Name) to Generic Package Registry..."
+      Invoke-RestMethod -Uri $pkgUrl -Method Put `
+        -Headers @{"PRIVATE-TOKEN" = "$GITLAB_API_TOKEN"} `
+        -InFile $exe.FullName
+
+    # Add asset link to the release
+    - |
+      $exe = Get-ChildItem "dist/Count and Design*.exe" | Select-Object -First 1
+      $safeName = $exe.Name -replace '\s+', '_'
+      $encodedName = [uri]::EscapeDataString($safeName)
+      $downloadUrl = "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/count-and-design/$releaseTag/$encodedName"
+      $linkBody = @{
+        name = $exe.Name
+        url = $downloadUrl
+        link_type = "package"
+      } | ConvertTo-Json
+      Write-Host "Adding asset link to release $releaseTag..."
+      Invoke-RestMethod -Uri "$CI_API_V4_URL/projects/$CI_PROJECT_ID/releases/$releaseTag/assets/links" `
+        -Method Post `
+        -Headers @{"PRIVATE-TOKEN" = "$GITLAB_API_TOKEN"; "Content-Type" = "application/json"} `
+        -Body $linkBody
+
+    # Clean up only this job's release type — keep the latest 3 independently
+    - |
+      $pattern = $RELEASE_TAG_PATTERN
+      Write-Host "Fetching $RELEASE_KIND releases for cleanup..."
+      $releases = Invoke-RestMethod -Uri "$CI_API_V4_URL/projects/$CI_PROJECT_ID/releases?per_page=50" `
+        -Headers @{"PRIVATE-TOKEN" = "$GITLAB_API_TOKEN"}
+      $testReleases = @($releases | Where-Object { $_.tag_name -match $pattern } | Sort-Object { $_.created_at } -Descending)
+      Write-Host "Found $($testReleases.Count) $RELEASE_KIND release(s) total"
+
+      $toDelete = $testReleases | Select-Object -Skip 3
+      if ($toDelete.Count -eq 0) {
+        Write-Host "[OK] No old $RELEASE_KIND releases to clean up. (Total: <=3)"
+      } else {
+        Write-Host "Deleting $($toDelete.Count) old $RELEASE_KIND release(s):"
+        foreach ($r in $toDelete) {
+          Write-Host "  - $($r.tag_name) (created $($r.created_at))"
+          try {
+            Invoke-RestMethod -Uri "$CI_API_V4_URL/projects/$CI_PROJECT_ID/releases/$($r.tag_name)" `
+              -Method Delete -Headers @{"PRIVATE-TOKEN" = "$GITLAB_API_TOKEN"}
+          } catch {
+            Write-Host "    [WARN] Delete release failed: $_"
+          }
+          try {
+            Invoke-RestMethod -Uri "$CI_API_V4_URL/projects/$CI_PROJECT_ID/repository/tags/$($r.tag_name)" `
+              -Method Delete -Headers @{"PRIVATE-TOKEN" = "$GITLAB_API_TOKEN"}
+          } catch {
+            Write-Host "    [WARN] Delete tag failed: $_"
+          }
+        }
+        Write-Host "[OK] Cleanup complete."
+      }
+
+    - Write-Host "$RELEASE_KIND build complete."
+
+# ============================================================
+# Stage 2b: Dev Preview — 仅 dev 分支，进入现有 Dev 更新通道
+# ============================================================
+build-dev-preview:
+  extends: .build-test-release
+  variables:
+    RELEASE_KIND: "Dev Preview"
+    RELEASE_TAG_SUFFIX: ""
+    BUILD_VERSION_SUFFIX: ""
+    RELEASE_TAG_PATTERN: '^v\d{8}\.\d{6}$'
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "dev"'
+
+# ============================================================
+# Stage 2c: SIT Test — 任意以 -SIT 结尾的分支，不进入任何更新通道
+# ============================================================
+build-sit-test:
+  extends: .build-test-release
+  variables:
+    RELEASE_KIND: "SIT Test"
+    RELEASE_TAG_SUFFIX: "-SIT"
+    BUILD_VERSION_SUFFIX: "+sit"
+    RELEASE_TAG_PATTERN: '^v\d{8}\.\d{6}-SIT$'
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /-SIT$/'

@@ -1,0 +1,10 @@
+# Merge this table into your Codex MCP configuration; do not replace other settings.
+[mcp_servers.count-and-design]
+command = 'C:\Data\2D_design\count-and-design\.venv\Scripts\python.exe'
+args = ['-m', 'count_and_design.integration.mcp_server']
+cwd = 'C:\Data\2D_design\count-and-design'
+startup_timeout_sec = 20
+tool_timeout_sec = 120
+
+[mcp_servers.count-and-design.env]
+COUNT_DESIGN_PROJECT_ROOT = 'C:\Data\2D_design\count-and-design'

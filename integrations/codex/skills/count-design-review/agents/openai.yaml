@@ -1,0 +1,6 @@
+interface:
+  display_name: "Count and Design Review"
+  short_description: "Review drawing results and batch evidence-backed corrections"
+  default_prompt: "Use $count-design-review to review the current Count and Design results and efficiently apply authorized corrections."
+policy:
+  allow_implicit_invocation: true
