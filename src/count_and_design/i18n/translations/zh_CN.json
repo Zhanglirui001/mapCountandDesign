@@ -1,4 +1,5 @@
 {
+  "ai_statistics.queue.waiting": "排队中 · 前方 {count} 个任务",
   "app.title": "统计与设计",
   "app.version": "版本 0.1.0",
   "app.about": "<h2>统计与设计</h2><p>版本 0.1.0</p><p>一款基于 Qt 的太阳能项目设计与统计应用。</p>",

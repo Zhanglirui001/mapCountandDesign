@@ -362,7 +362,8 @@ class MainWindow(QMainWindow):
             self._view_model.add_inv(name)
 
     def _render_state(self, state) -> None:
-        self.setWindowTitle(state.title)
+        window_id = getattr(self, "_mcp_window_id", None)
+        self.setWindowTitle(f"{state.title} [{window_id}]" if window_id else state.title)
 
     def _import_and_merge(self) -> None:
         self._file_controller.import_and_merge()
@@ -394,6 +395,9 @@ class MainWindow(QMainWindow):
         self._product_export_controller.run()
 
     def closeEvent(self, event) -> None:
+        if not self._ai_statistics_tab._view_model.shutdown():
+            event.ignore()
+            return
         if (
             self._count_tab is not None
             and not self._count_tab.shutdown_voltage_calculation()

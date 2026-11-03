@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import threading
 import time
+import os
 from io import BytesIO
 from types import SimpleNamespace
 
@@ -32,6 +33,16 @@ from count_and_design.application.ai_statistics.models import (
     LazyPageImages,
     NodeDraft,
 )
+
+
+@pytest.fixture(autouse=True)
+def isolated_agent3_configuration(tmp_path, monkeypatch):
+    # Developer .env settings (especially grayscale and worker limits) must
+    # not change synthetic page identifiers or assertions about defaults.
+    monkeypatch.setenv("ENV_FILE", str(tmp_path / "unused.env"))
+    for key in list(os.environ):
+        if key.startswith("AGENT3_"):
+            monkeypatch.delenv(key)
 
 
 def _tiny_png() -> bytes:

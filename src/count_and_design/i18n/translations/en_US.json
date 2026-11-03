@@ -1,4 +1,5 @@
 {
+  "ai_statistics.queue.waiting": "Queued · {count} task(s) ahead",
   "_comment": "English (US) translation table. Keys are organized by module. Copy this file to start a new locale.",
   "app.title": "Count and Design",
   "app.version": "Version 0.1.0",

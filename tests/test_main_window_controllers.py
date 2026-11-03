@@ -41,7 +41,7 @@ def test_project_file_controller_writes_unsaved_recovery(
     recovery = (
         tmp_path
         / "count-and-design-update"
-        / "pre_update_recovery.json"
+        / f"pre_update_recovery-{os.getpid()}.json"
     )
     payload = json.loads(recovery.read_text(encoding="utf-8"))
     assert payload["invs"][0]["name"] == "INV1"

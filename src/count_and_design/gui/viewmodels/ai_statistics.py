@@ -4,8 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import sqlite3
+from uuid import uuid4
 
-from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtCore import QObject, QThread, QTimer, Signal
+
+from ...application.recognition_queue import (
+    RecognitionTicket,
+    is_queue_busy,
+    queue_directory,
+)
 
 from ...application.ai_statistics import (
     AIStatisticsActiveTask,
@@ -37,6 +45,8 @@ class StageStatusState:
 
 @dataclass(frozen=True)
 class AIStatisticsViewState:
+    recognition_queued: bool = False
+    queue_position: int = 0
     pdf_path: Path | None = None
     page_count: int = 0
     current_stage: int = 0
@@ -159,9 +169,11 @@ class Agent3RecognitionThread(QThread):
         self,
         workflow: AIStatisticsWorkflow,
         parent: QObject | None = None,
+        admission: tuple[str, str] | None = None,
     ) -> None:
         super().__init__(parent)
         self._workflow = workflow
+        self._admission = admission
 
     def run(self) -> None:
         try:
@@ -169,6 +181,7 @@ class Agent3RecognitionThread(QThread):
                 on_progress=self.progress.emit,
                 on_step=self.step_changed.emit,
                 is_cancelled=self.isInterruptionRequested,
+                admission=self._admission,
             )
         except Agent3Cancelled:
             self.cancelled.emit()
@@ -238,10 +251,21 @@ class AIStatisticsViewModel(QObject):
         self._workflow = workflow or AIStatisticsWorkflow(
             auto_warm_element_runtime=True
         )
-        self._state = self._build_state()
         self._agent1_thread: Agent1ClassificationThread | None = None
         self._agent3_thread: Agent3RecognitionThread | None = None
         self._agent2_thread: Agent2InformationRecognitionThread | None = None
+        # Agent1/2 use window-local lanes. Memory-heavy Agent3 jobs share one
+        # FIFO lane, retaining admission until their worker actually exits.
+        self._recognition_directory = queue_directory() / "windows" / uuid4().hex
+        self._recognition_ticket = None
+        self._pending_stage = None
+        self._recognition_stage = None
+        self._queue_position = 0
+        self.recognition_cancelled = False
+        self._queue_timer = QTimer(self)
+        self._queue_timer.setInterval(250)
+        self._queue_timer.timeout.connect(self._poll_recognition_queue)
+        self._state = self._build_state()
 
     @property
     def state(self) -> AIStatisticsViewState:
@@ -268,7 +292,8 @@ class AIStatisticsViewModel(QObject):
     @property
     def is_ai_running(self) -> bool:
         return (
-            self.is_agent1_running
+            self._recognition_ticket is not None
+            or self.is_agent1_running
             or self.is_agent2_running
             or self.is_agent3_running
         )
@@ -286,18 +311,97 @@ class AIStatisticsViewModel(QObject):
         self._publish()
 
     def start_ai_model(self) -> bool:
-        if (
-            self._workflow.snapshot.selected_stage
-            == AIStatisticsStage.ELEMENT_RECOGNITION
-        ):
-            return self.start_element_recognition()
+        return self._request_recognition(self._workflow.snapshot.selected_stage)
+
+    def start_element_recognition(self) -> bool:
+        return self._request_recognition(AIStatisticsStage.ELEMENT_RECOGNITION)
+
+    def _request_recognition(self, stage) -> bool:
         if self.is_ai_running:
             return False
-        if (
-            self._workflow.snapshot.selected_stage
-            == AIStatisticsStage.INFO_RECOGNITION
-        ):
-            return self._start_information_recognition()
+        if stage != self._workflow.snapshot.selected_stage:
+            raise ValueError("Select the requested recognition stage first")
+        if not (self._workflow.is_run_enabled() or self._workflow.is_overall_site_run_enabled()):
+            raise ValueError("The selected recognition stage is not ready to run")
+        self._recognition_ticket = RecognitionTicket(self._admission_directory(stage))
+        self.recognition_cancelled = False
+        self._pending_stage = stage
+        self._recognition_stage = stage
+        self._queue_inputs = self._recognition_inputs()
+        try:
+            self._poll_recognition_queue(raise_errors=True)
+        except Exception:
+            self._release_recognition_slot()
+            raise
+        return True
+
+    def _admission_directory(self, stage):
+        if stage == AIStatisticsStage.ELEMENT_RECOGNITION:
+            return self._recognition_directory.parent.parent / "agent3"
+        return self._recognition_directory
+
+    def _recognition_inputs(self):
+        s = self._workflow.snapshot
+        return (s.pdf_path, id(s.page_classification), id(s.overall_site_extractions), id(s.element_recognition_result),
+                repr(self._workflow.element_recognition_request_metadata))
+
+    def _poll_recognition_queue(self, *, raise_errors=False):
+        if self._pending_stage is None:
+            return
+        stage = self._pending_stage
+        try:
+            acquired, position = self._recognition_ticket.poll()
+            changed = position != self._queue_position
+            self._queue_position = position
+            if not acquired:
+                self._queue_timer.start()
+                if changed or not self._state.recognition_queued:
+                    self._publish()
+                return
+            self._queue_timer.stop()
+            if self._recognition_inputs() != self._queue_inputs:
+                raise ValueError("Recognition inputs changed while queued; submit the stage again")
+            if self._workflow.snapshot.selected_stage != stage:
+                self._workflow.set_current_stage(stage.index)
+            self._pending_stage = None
+            if stage == AIStatisticsStage.ELEMENT_RECOGNITION:
+                self._start_element_now()
+            elif stage == AIStatisticsStage.INFO_RECOGNITION:
+                self._start_information_recognition()
+            else:
+                self._start_classification_now()
+        except sqlite3.OperationalError as exc:
+            if is_queue_busy(exc) and self._pending_stage is not None:
+                # Retain the FIFO ticket and retry when the short-lived DB lock
+                # clears. Never stop scheduling or release a still-pending job.
+                self._queue_timer.start()
+                self._publish()
+                return
+            self._recognition_queue_failed(stage, exc, raise_errors)
+        except Exception as exc:
+            self._recognition_queue_failed(stage, exc, raise_errors)
+
+    def _recognition_queue_failed(self, stage, exc, raise_errors):
+        self._release_recognition_slot()
+        if raise_errors:
+            raise exc
+        fail = {AIStatisticsStage.PAGE_CLASSIFICATION: self._workflow.fail_page_classification,
+                AIStatisticsStage.INFO_RECOGNITION: self._workflow.fail_overall_site_recognition,
+                AIStatisticsStage.ELEMENT_RECOGNITION: self._workflow.fail_element_recognition}[stage]
+        fail(str(exc))
+        self._publish()
+        self.operation_failed.emit(str(exc))
+
+    def _release_recognition_slot(self):
+        self._queue_timer.stop()
+        if self._recognition_ticket is not None:
+            self._recognition_ticket.close()
+        self._recognition_ticket = None
+        self._pending_stage = None
+        self._recognition_stage = None
+        self._queue_position = 0
+
+    def _start_classification_now(self) -> bool:
         self._workflow.begin_page_classification()
         self._publish()
         thread = Agent1ClassificationThread(self._workflow, self)
@@ -310,12 +414,11 @@ class AIStatisticsViewModel(QObject):
         thread.start()
         return True
 
-    def start_element_recognition(self) -> bool:
-        if self.is_ai_running:
-            return False
+    def _start_element_now(self) -> bool:
         self._workflow.begin_element_recognition()
         self._publish()
-        thread = Agent3RecognitionThread(self._workflow, self)
+        thread = Agent3RecognitionThread(self._workflow, self,
+                                         admission=self._recognition_ticket.worker_admission)
         thread.progress.connect(self._on_element_progress)
         thread.step_changed.connect(self._on_element_step)
         thread.succeeded.connect(self._on_element_succeeded)
@@ -327,8 +430,6 @@ class AIStatisticsViewModel(QObject):
         return True
 
     def _start_information_recognition(self) -> bool:
-        if self.is_ai_running:
-            return False
         self._workflow.begin_overall_site_recognition()
         self._publish()
         thread = Agent2InformationRecognitionThread(self._workflow, self)
@@ -342,6 +443,12 @@ class AIStatisticsViewModel(QObject):
         return True
 
     def cancel_ai_model(self) -> None:
+        self.recognition_cancelled = True
+        if self._pending_stage is not None:
+            self._release_recognition_slot()
+            self._publish()
+            self.operation_cancelled.emit()
+            return
         if self._agent1_thread is not None:
             self._agent1_thread.requestInterruption()
         if self._agent3_thread is not None:
@@ -407,10 +514,17 @@ class AIStatisticsViewModel(QObject):
 
     def run_ai_model(self) -> PageClassificationResult:
         """Synchronous compatibility entry point for non-GUI callers."""
-
-        result = self._workflow.run_page_classification()
-        self._publish()
-        return result
+        if self.is_ai_running:
+            raise RuntimeError("A recognition task is already queued or running")
+        ticket = RecognitionTicket(self._recognition_directory)
+        try:
+            if not ticket.poll()[0]:
+                raise RuntimeError("Recognition is busy; use start_ai_model() to queue without blocking")
+            result = self._workflow.run_page_classification()
+            self._publish()
+            return result
+        finally:
+            ticket.close()
 
     def confirm_current_stage(self) -> int:
         snapshot = self._workflow.confirm_current_stage()
@@ -418,6 +532,8 @@ class AIStatisticsViewModel(QObject):
         return snapshot.selected_stage.index
 
     def set_current_stage(self, index: int) -> None:
+        # Browsing available results does not change the stage held in the
+        # queue. Admission restores that stage immediately before execution.
         self._workflow.set_current_stage(index)
         self._publish()
 
@@ -450,6 +566,8 @@ class AIStatisticsViewModel(QObject):
         self._publish()
 
     def shutdown(self, timeout_ms: int = 5000) -> bool:
+        if self._pending_stage is not None:
+            self.cancel_ai_model()
         running = [
             thread
             for thread in (
@@ -463,7 +581,10 @@ class AIStatisticsViewModel(QObject):
             thread.requestInterruption()
         if self._agent3_thread in running:
             self._workflow.cancel_element_execution()
-        return all(thread.wait(timeout_ms) for thread in running)
+        stopped = all(thread.wait(timeout_ms) for thread in running)
+        if stopped:
+            self._release_recognition_slot()
+        return stopped
 
     def _on_progress(self, completed: int, total: int) -> None:
         self._workflow.update_page_classification_progress(completed, total)
@@ -490,6 +611,8 @@ class AIStatisticsViewModel(QObject):
         self._agent1_thread = None
         if thread is not None:
             thread.deleteLater()
+        self._release_recognition_slot()
+        self._publish()
 
     def _on_element_progress(self, completed: int, total: int) -> None:
         self._workflow.update_element_recognition_progress(completed, total)
@@ -525,6 +648,8 @@ class AIStatisticsViewModel(QObject):
         self._agent3_thread = None
         if thread is not None:
             thread.deleteLater()
+        self._release_recognition_slot()
+        self._publish()
 
     def _on_agent2_succeeded(
         self,
@@ -557,6 +682,8 @@ class AIStatisticsViewModel(QObject):
         self._agent2_thread = None
         if thread is not None:
             thread.deleteLater()
+        self._release_recognition_slot()
+        self._publish()
 
     def _publish(self) -> None:
         self._state = self._build_state()
@@ -568,6 +695,8 @@ class AIStatisticsViewModel(QObject):
             snapshot.selected_stage == AIStatisticsStage.ELEMENT_RECOGNITION
         )
         return AIStatisticsViewState(
+            recognition_queued=self._pending_stage is not None,
+            queue_position=self._queue_position,
             pdf_path=snapshot.pdf_path,
             page_count=snapshot.page_count,
             current_stage=snapshot.selected_stage.index,
@@ -582,22 +711,27 @@ class AIStatisticsViewModel(QObject):
                 else None
             ),
             run_enabled=(
+                not self.is_ai_running and (
                 self._workflow.is_run_enabled()
                 or self._workflow.is_overall_site_run_enabled()
+                )
             ),
             classification_running=(
+                (self._recognition_ticket is not None and self._recognition_stage == AIStatisticsStage.PAGE_CLASSIFICATION) or
                 self._workflow.status_for(
                     AIStatisticsStage.PAGE_CLASSIFICATION
                 )
                 == AIStatisticsStageStatus.RUNNING
             ),
             element_running=(
+                (self._recognition_ticket is not None and self._recognition_stage == AIStatisticsStage.ELEMENT_RECOGNITION) or
                 self._workflow.status_for(
                     AIStatisticsStage.ELEMENT_RECOGNITION
                 )
                 == AIStatisticsStageStatus.RUNNING
             ),
             information_recognition_running=(
+                (self._recognition_ticket is not None and self._recognition_stage == AIStatisticsStage.INFO_RECOGNITION) or
                 self._workflow.status_for(
                     AIStatisticsStage.INFO_RECOGNITION
                 )
@@ -634,13 +768,13 @@ class AIStatisticsViewModel(QObject):
             overall_site_extractions=snapshot.overall_site_extractions,
             overall_site_orientation=snapshot.overall_site_orientation,
             confirm_enabled=(
-                self._workflow.is_confirm_enabled(
+                not self.is_ai_running and self._workflow.is_confirm_enabled(
                     AIStatisticsStage.PAGE_CLASSIFICATION
                 ),
-                self._workflow.is_confirm_enabled(
+                not self.is_ai_running and self._workflow.is_confirm_enabled(
                     AIStatisticsStage.INFO_RECOGNITION
                 ),
-                self._workflow.is_confirm_enabled(
+                not self.is_ai_running and self._workflow.is_confirm_enabled(
                     AIStatisticsStage.ELEMENT_RECOGNITION
                 ),
             ),

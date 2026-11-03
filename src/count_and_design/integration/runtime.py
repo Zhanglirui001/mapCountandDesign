@@ -3,6 +3,8 @@
 import os
 from pathlib import Path
 import sys
+from hashlib import sha256
+from uuid import uuid4
 
 
 def project_root() -> Path:
@@ -25,6 +27,19 @@ def gui_command(discovery_file: Path) -> list[str]:
     if not getattr(sys, "frozen", False):
         prefix += ["-m", "count_and_design"]
     return prefix + ["--codex-bridge", str(discovery_file)]
+
+
+def new_bridge_file() -> Path:
+    return bridge_file().parent / "windows" / uuid4().hex / "bridge.json"
+
+
+def window_id(discovery_file: Path) -> str:
+    return sha256(str(discovery_file.resolve()).encode("utf-8")).hexdigest()[:16]
+
+
+def bridge_candidates() -> list[Path]:
+    default = bridge_file()
+    return [default, *sorted((default.parent / "windows").glob("*/bridge.json"))]
 
 
 def prepare_stdio() -> None:

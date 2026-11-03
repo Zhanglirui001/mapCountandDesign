@@ -875,6 +875,7 @@ class AIStatisticsWorkflow:
         on_progress=None,
         on_step=None,
         is_cancelled=None,
+        admission=None,
     ) -> ElementRecognitionResult:
         if self.status_for(AIStatisticsStage.ELEMENT_RECOGNITION) != AIStatisticsStageStatus.RUNNING:
             raise AIStatisticsWorkflowError("Agent3 has not been started.")
@@ -906,6 +907,7 @@ class AIStatisticsWorkflow:
                 on_progress=on_progress,
                 on_step=on_step,
                 is_cancelled=is_cancelled,
+                admission=admission,
             )
             if isinstance(images, LazyPageImages):
                 for page_number, image in rendered_images.items():

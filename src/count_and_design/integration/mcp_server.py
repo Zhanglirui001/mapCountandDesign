@@ -12,18 +12,22 @@ from time import monotonic, sleep
 from urllib.parse import urlsplit
 
 import requests
-from .runtime import bridge_file, gui_command, project_root
+from .runtime import bridge_file, bridge_candidates, gui_command, new_bridge_file, project_root, window_id
 
 
 class BridgeClient:
     def __init__(self, discovery_file=None):
         self.root = project_root()
         self.discovery_file = Path(discovery_file or bridge_file()).resolve()
+        self._selected = discovery_file is not None or bool(os.environ.get("COUNT_DESIGN_BRIDGE_FILE"))
         self._launch_lock = Lock()
 
     def call(self, tool, **arguments):
+        return self._call_file(self.discovery_file, tool, arguments)
+
+    def _call_file(self, discovery_file, tool, arguments, timeout=(3, 95)):
         try:
-            connection = json.loads(self.discovery_file.read_text(encoding="utf-8"))
+            connection = json.loads(discovery_file.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             raise RuntimeError("No app session. Call start_session first.") from exc
         url = urlsplit(connection["url"])
@@ -34,15 +38,57 @@ class BridgeClient:
             session.trust_env = False
             response = session.post(connection["url"], json={"tool": tool, "arguments": arguments},
                                     headers={"Authorization": "Bearer " + connection["token"]},
-                                    timeout=(3, 95))
+                                    timeout=timeout)
         response.raise_for_status()
         payload = response.json()
         if "error" in payload:
             raise ValueError(payload["error"])
         return payload["result"]
 
-    def start(self):
+    def list_sessions(self):
+        candidates = set(bridge_candidates()) | {self.discovery_file}
+        sessions = []
+        for candidate in sorted(candidates):
+            try:
+                state = self._call_file(candidate, "get_job_status", {}, timeout=(1, 3))
+            except requests.Timeout:
+                # A busy GUI is still a candidate. Do not silently create a
+                # replacement window just because a status read timed out.
+                state = {"connection_status": "unresponsive"}
+            except (OSError, ValueError, KeyError, RuntimeError, requests.RequestException):
+                continue
+            sessions.append({**state, "window_id": window_id(candidate),
+                             "selected": self._selected and candidate == self.discovery_file})
+        return {"sessions": sessions}
+
+    def start(self, new_window=False, selected_window_id=None):
         with self._launch_lock:
+            if new_window and selected_window_id is not None:
+                raise ValueError("Choose either new_window or window_id")
+            if selected_window_id is not None:
+                matches = [p for p in set(bridge_candidates()) | {self.discovery_file}
+                           if window_id(p) == selected_window_id and p.is_file()]
+                if not matches:
+                    raise ValueError("Unknown window_id; call list_sessions first")
+                # Commit selection only after proving the target is available.
+                result = self._call_file(matches[0], "start_session", {})
+                self.discovery_file = matches[0]
+                self._selected = True
+                return result
+            if new_window:
+                self.discovery_file = new_bridge_file().resolve()
+                self._selected = True
+            elif not self._selected:
+                sessions = self.list_sessions()["sessions"]
+                if len(sessions) > 1:
+                    raise ValueError("Multiple windows are open. Call list_sessions, then start_session(window_id=...), "
+                                     "or use start_session(new_window=True).")
+                if sessions:
+                    selected = sessions[0]["window_id"]
+                    self.discovery_file = next(p for p in bridge_candidates() if window_id(p) == selected)
+                else:
+                    self.discovery_file = new_bridge_file().resolve()
+                self._selected = True
             try:
                 return self.call("start_session")
             except (OSError, ValueError, RuntimeError, requests.RequestException):
@@ -82,7 +128,15 @@ def create_server(client=None):
     server = FastMCP(
         "count-and-design",
         instructions=(
-            "Electrical/PV PDF recognition and correction tools. Start a session, import a PDF, "
+            "Electrical/PV PDF recognition and correction tools. start_session(new_window=True) creates "
+            "an isolated window. list_sessions and start_session(window_id=...) select a window; "
+            "all subsequent tools target that selected window. Never switch windows during a write. "
+            "For a new/additional project, use start_session(new_window=True), even when the existing "
+            "PDF has not been recognized. Reuse sessions only to continue the same project. "
+            "Never replace an existing PDF unless the user explicitly requests replacement. "
+            "Agent3 jobs share a FIFO queue with one running Agent3 across all windows; "
+            "Agent1 and Agent2 run independently in other windows without waiting for Agent3. "
+            "Start a session, import a PDF, "
             "start recognition and poll get_job_status. Read project context and inspect original "
             "images via get_review_evidence before proposing changes. Preview with current "
             "project_id/revision/evidence_ids, then apply using preview_id and a unique request_id. "
@@ -92,16 +146,38 @@ def create_server(client=None):
     )
 
     @server.tool()
-    def start_session() -> dict:
-        """Connect to the local app, or launch its GUI with the shared review bridge."""
-        return client.start()
+    def start_session(new_window: bool = False, window_id: str | None = None) -> dict:
+        """Connect/start a window. new_window=True creates an isolated project.
+        window_id selects a listed window; other tools then target that window.
+        With no arguments, reuse this client's selected window, or the only open window.
+        Multiple unselected windows require explicit selection; never guess a project.
+        For a new/additional project use new_window=True, including when an existing
+        window has an imported PDF but recognition has not started.
+        """
+        if not new_window and window_id is None:
+            return client.start()
+        return client.start(new_window=new_window, selected_window_id=window_id)
 
     @server.tool()
-    def import_pdf(path: str) -> dict:
-        """Import a local absolute PDF path into the app. Replaces this session's drawing."""
+    def list_sessions() -> dict:
+        """List live windows with window_id, project/PDF status and current selection."""
+        return client.list_sessions()
+
+    @server.tool()
+    def cancel_recognition() -> dict:
+        """Cancel the selected window's queued or running stage; other windows are unaffected."""
+        return client.call("cancel_recognition")
+
+    @server.tool()
+    def import_pdf(path: str, replace_existing: bool = False) -> dict:
+        """Import a local absolute PDF into the selected empty window.
+        Existing PDFs are protected even before recognition. For another project,
+        first call start_session(new_window=True). Set replace_existing=True only
+        when the user explicitly asks to replace the selected window's drawing.
+        """
         if not Path(path).is_absolute():
             raise ValueError("Use an absolute local PDF path")
-        return client.call("import_pdf", path=path)
+        return client.call("import_pdf", path=path, replace_existing=replace_existing)
 
     @server.tool()
     def start_recognition(stage: str | int = "all", panel_orientation: str | None = None) -> dict:

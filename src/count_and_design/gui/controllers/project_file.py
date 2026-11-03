@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tempfile
+import os
 from pathlib import Path
 
 from PySide6.QtWidgets import QFileDialog, QMessageBox, QWidget
@@ -133,7 +134,7 @@ class ProjectFileController:
         try:
             recovery = Path(tempfile.gettempdir()) / "count-and-design-update"
             recovery.mkdir(parents=True, exist_ok=True)
-            recovery_file = recovery / "pre_update_recovery.json"
+            recovery_file = recovery / f"pre_update_recovery-{os.getpid()}.json"
             atomic_write_json(
                 recovery_file,
                 self._view_model.build_recovery_payload(),

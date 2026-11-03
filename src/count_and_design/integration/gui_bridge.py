@@ -14,6 +14,7 @@ from PySide6.QtCore import QObject, QTimer
 
 from ..application.ai_statistics.models import AIStatisticsStageStatus
 from .review_session import ReviewSession, write_json
+from .runtime import window_id
 
 
 class GuiBridge(QObject):
@@ -24,6 +25,7 @@ class GuiBridge(QObject):
         self.vm = self.tab._view_model
         self.tab._tool_session_active = True
         self.discovery_file = Path(discovery_file).resolve()
+        self.window_id = window_id(self.discovery_file)
         self.session = ReviewSession(self.vm, self.discovery_file.parent / "projects")
         self.queue = Queue(maxsize=32)
         self.jobs = {}
@@ -79,7 +81,7 @@ class GuiBridge(QObject):
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.server.daemon_threads = True
         Thread(target=self.server.serve_forever, daemon=True).start()
-        write_json(self.discovery_file, {"pid": os.getpid(), "url": f"http://127.0.0.1:{self.server.server_port}/tools",
+        write_json(self.discovery_file, {"window_id": self.window_id, "pid": os.getpid(), "url": f"http://127.0.0.1:{self.server.server_port}/tools",
                                          "token": self.token})
 
     def close(self):
@@ -127,9 +129,17 @@ class GuiBridge(QObject):
             future.set_result({"error": str(exc)})
 
     def _advance_job(self):
-        if not self.active_job or self.vm.is_ai_running:
+        if not self.active_job:
             return
         job = self.jobs[self.active_job]
+        if self.vm.is_ai_running:
+            job.update(status="queued" if self.vm.state.recognition_queued else "running",
+                       queue_position=self.vm.state.queue_position)
+            return
+        if self.vm.recognition_cancelled:
+            job.update(status="cancelled", queue_position=0)
+            self.active_job = None
+            return
         stage = job["stage"]
         status = self.vm.workflow.snapshot.stage_statuses[stage]
         if status == AIStatisticsStageStatus.FAILED:
@@ -164,21 +174,35 @@ class GuiBridge(QObject):
             job_id = args.get("job_id")
             if job_id is not None and job_id not in self.jobs:
                 raise ValueError("Unknown job_id")
-            return {**self.session.status(), "job": self.jobs.get(job_id or self.active_job)}
+            self._advance_job()
+            return {**self._status(), "job": self.jobs.get(job_id or self.active_job)}
         if tool == "start_session":
             self.window.showNormal()
             self.window.raise_()
             self.window.activateWindow()
-            return self.session.status()
+            return self._status()
+        if tool == "cancel_recognition":
+            job_id = self.active_job
+            self.vm.cancel_ai_model()
+            self._advance_job()
+            return {**self._status(), "job": self.jobs.get(job_id)}
         if tool in {"import_pdf", "start_recognition", "preview_corrections", "apply_corrections",
                     "preview_stage_corrections", "confirm_stage_review"}:
             if self.active_job or self.tab._upload_in_progress:
                 raise ValueError("Wait for the active upload/recognition job")
         if tool == "import_pdf":
+            # An imported but unprocessed PDF is already user work. Protect it
+            # at the GUI boundary too, including callers bypassing the MCP tool.
+            if self.vm.workflow.snapshot.pdf_path and args.get("replace_existing") is not True:
+                raise ValueError(
+                    "This window already contains a PDF, even if recognition has not started. "
+                    "Use start_session(new_window=True) to import another project. "
+                    "Use replace_existing=True only when the user explicitly requests replacement."
+                )
             self.tab.load_pdf_for_tools(args["path"])
             # Even reimporting the same filename represents a new document run.
             self.session = ReviewSession(self.vm, self.discovery_file.parent / "projects")
-            return self.session.status()
+            return self._status()
         if tool == "start_recognition":
             self.session.require_idle()
             snapshot = self.vm.workflow.snapshot
@@ -211,10 +235,18 @@ class GuiBridge(QObject):
             if not self.vm.start_ai_model():
                 raise ValueError("Recognition did not start")
             job_id = uuid4().hex
-            self.jobs[job_id] = {"job_id": job_id, "stage": index, "status": "running"}
+            self.jobs[job_id] = {"job_id": job_id, "stage": index,
+                                 "status": "queued" if self.vm.state.recognition_queued else "running",
+                                 "queue_position": self.vm.state.queue_position}
             self.jobs[job_id]["panel_orientation"] = orientation
             self.active_job = job_id
-            return {**self.session.status(), "job_id": job_id}
+            return {**self._status(), "job_id": job_id, "job": self.jobs[job_id]}
         if tool in methods:
-            return methods[tool](**args)
+            result = methods[tool](**args)
+            return {**result, "window_id": self.window_id} if isinstance(result, dict) else result
         raise ValueError("Unknown tool")
+
+    def _status(self):
+        return {**self.session.status(), "window_id": self.window_id,
+                "recognition_queued": self.vm.state.recognition_queued,
+                "queue_position": self.vm.state.queue_position}

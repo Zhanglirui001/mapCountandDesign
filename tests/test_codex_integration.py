@@ -384,13 +384,20 @@ def test_mcp_returns_native_images_and_tool_schemas():
 
     async def verify():
         tools = await server.list_tools()
-        assert len(tools) == 12
+        assert len(tools) == 14
         assert "operations" in next(t for t in tools if t.name == "preview_corrections").inputSchema["properties"]
+        import_schema = next(t for t in tools if t.name == "import_pdf").inputSchema
+        assert import_schema["properties"]["replace_existing"]["default"] is False
         content = await server.call_tool("get_review_evidence", {"page_number": 1})
         # SDK may return (content, structuredContent) when it infers output schemas.
         if isinstance(content, tuple):
             content = content[0]
         assert [c.type for c in content] == ["text", "image"]
+        local_pdf = str(Path.cwd() / "drawing.pdf")
+        await server.call_tool("import_pdf", {"path": local_pdf})
+        fake.call.assert_called_with("import_pdf", path=local_pdf, replace_existing=False)
+        await server.call_tool("import_pdf", {"path": local_pdf, "replace_existing": True})
+        fake.call.assert_called_with("import_pdf", path=local_pdf, replace_existing=True)
     asyncio.run(verify())
 
 
@@ -410,16 +417,51 @@ def test_mcp_stdio_handshake_and_tool_error(tmp_path):
                     initialized = await client.initialize()
                     assert initialized.serverInfo.name == "count-and-design"
                     tools = await client.list_tools()
-                    assert len(tools.tools) == 12
+                    assert len(tools.tools) == 14
                     result = await client.call_tool("get_job_status", {})
                     assert result.isError
                     assert "start_session" in result.content[0].text
     asyncio.run(verify())
 
 
-@pytest.mark.parametrize("stage", ["all", 0, 1])
-def test_pipeline_job_uses_real_viewmodel_workers(prepared, drawing, tmp_path, app, stage):
+@pytest.mark.parametrize("same_path", [False, True])
+def test_import_protects_manually_loaded_unprocessed_pdf(drawing, tmp_path, app, same_path):
+    # Simulate a user importing before Codex connects, without running a stage.
+    workflow = AIStatisticsWorkflow(FakePageClassificationProvider())
+    workflow.load_pdf(drawing, 2)
+    vm = AIStatisticsViewModel(workflow)
+    tab = AIStatisticsTab(view_model=vm)
+    window = QWidget()
+    window._ai_statistics_tab = tab
+    bridge = GuiBridge(window, tmp_path / "manual.json")
+    other = drawing if same_path else tmp_path / "other.pdf"
+    if not same_path:
+        other.write_bytes(drawing.read_bytes())
+    try:
+        before = bridge.dispatch("start_session", {})
+        snapshot = workflow.snapshot
+        session = bridge.session
+        with pytest.raises(ValueError, match="new_window=True"):
+            bridge.dispatch("import_pdf", {"path": str(other)})
+        assert workflow.snapshot is snapshot
+        assert bridge.session is session
+        assert bridge._status() == before
+        assert snapshot.page_classification is None
+        replaced = bridge.dispatch("import_pdf", {"path": str(other), "replace_existing": True})
+        assert replaced["project_id"] != before["project_id"]
+        assert workflow.snapshot.pdf_path == other
+        assert replaced["page_count"] == 2
+    finally:
+        bridge.close()
+        tab.close()
+        window.close()
+
+
+@pytest.mark.parametrize("stage", ["all", 0, 1, 2])
+def test_pipeline_job_uses_real_viewmodel_workers(prepared, drawing, tmp_path, app, stage, monkeypatch):
     from conftest import sample_agent2_extraction
+    from count_and_design.application.recognition_queue import RecognitionTicket
+    monkeypatch.setenv("COUNT_DESIGN_QUEUE_DIR", str(tmp_path / "queue"))
     _, _, seed = prepared
     result = seed.result()
     stream = BytesIO()
@@ -438,19 +480,33 @@ def test_pipeline_job_uses_real_viewmodel_workers(prepared, drawing, tmp_path, a
     window = QWidget()
     window._ai_statistics_tab = tab
     bridge = GuiBridge(window, tmp_path / "pipeline.json")
+    blocker = None
     try:
         status = bridge.dispatch("import_pdf", {"path": str(drawing)})
         assert status["page_count"] == 2
-        if stage == 1:
+        if stage in (1, 2):
             vm.run_ai_model()
             evidence = [bridge.session.evidence(n)["metadata"]["evidence_id"] for n in (1, 2)]
             bridge.session.confirm_stage_review(bridge.session.project_id, bridge.session.revision,
                                                  0, evidence, "Both original pages checked")
+        if stage == 2:
+            info_job = bridge.dispatch("start_recognition", {"stage": 1, "panel_orientation": "P-N"})["job_id"]
+            for _ in range(600):
+                QTest.qWait(10)
+                if bridge.jobs[info_job]["status"] == "completed":
+                    break
+            assert bridge.jobs[info_job]["status"] == "completed"
+            bridge.session.confirm_stage_review(bridge.session.project_id, bridge.session.revision,
+                                                 1, [], "Overall extraction reviewed")
+        blocker = RecognitionTicket(vm._admission_directory(vm.workflow.snapshot.selected_stage))
         started = bridge.dispatch("start_recognition", {"stage": stage, "panel_orientation": "P-N"})
+        assert started["job"]["status"] == "queued"
+        assert started["queue_position"] == 1
+        blocker.close()
         job_id = started["job_id"]
         for _ in range(600):
             QTest.qWait(10)
-            if bridge.jobs[job_id]["status"] != "running":
+            if bridge.jobs[job_id]["status"] not in {"queued", "running"}:
                 break
         assert bridge.jobs[job_id]["status"] == "completed", bridge.jobs[job_id]
         if stage == "all":
@@ -459,11 +515,15 @@ def test_pipeline_job_uses_real_viewmodel_workers(prepared, drawing, tmp_path, a
             assert bridge.jobs[job_id]["review_required"]
             with pytest.raises(ValueError, match="requires confirm_stage_review"):
                 bridge.dispatch("start_recognition", {"stage": 1})
-        else:
+        elif stage != 2:
             assert workflow.snapshot.element_recognition_result is None
+        else:
+            assert workflow.snapshot.element_recognition_result is not None
         if stage == 1:
             assert workflow.element_recognition_request_metadata.default_panel_orientation.value == "P-N"
     finally:
+        if blocker is not None:
+            blocker.close()
         assert vm.shutdown()
         bridge.close()
         tab.close()
@@ -515,6 +575,54 @@ def test_start_session_launches_and_reconnects_real_gui(tmp_path, drawing, monke
         assert len(processes) == 1
     finally:
         # This test owns exactly the child processes recorded above.
+        for process in processes:
+            process.terminate()
+            process.wait(timeout=15)
+
+
+def test_multiple_real_windows_keep_projects_separate(tmp_path, drawing, monkeypatch):
+    import subprocess
+    import count_and_design.integration.mcp_server as module
+    from count_and_design.application.recognition_queue import RecognitionTicket
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "localappdata"))
+    monkeypatch.setenv("COUNT_DESIGN_PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setenv("COUNT_DESIGN_QUEUE_DIR", str(tmp_path / "queue"))
+    monkeypatch.delenv("COUNT_DESIGN_BRIDGE_FILE", raising=False)
+    processes = []
+    original = subprocess.Popen
+    def launch(*args, **kwargs):
+        process = original(*args, **kwargs)
+        processes.append(process)
+        return process
+    monkeypatch.setattr(module.subprocess, "Popen", launch)
+    client = BridgeClient()
+    try:
+        a = client.start(new_window=True)
+        imported = client.call("import_pdf", path=str(drawing))
+        # A new Codex client auto-connects to the sole preloaded window, but
+        # importing there must preserve the PDF even before recognition.
+        newcomer = BridgeClient()
+        assert newcomer.start()["project_id"] == imported["project_id"]
+        with pytest.raises(ValueError, match="new_window=True"):
+            newcomer.call("import_pdf", path=str(drawing))
+        assert newcomer.call("get_job_status")["project_id"] == imported["project_id"]
+        b = client.start(new_window=True)
+        assert a["window_id"] != b["window_id"]
+        assert b["page_count"] == 0
+        assert len(client.list_sessions()["sessions"]) == 2
+        assert client.start(selected_window_id=a["window_id"])["project_id"] == imported["project_id"]
+        assert client.call("get_project_context")["project_id"] == imported["project_id"]
+        client.start(selected_window_id=b["window_id"])
+        imported_b = client.call("import_pdf", path=str(drawing))
+        assert imported_b["project_id"] != imported["project_id"]
+        client.start(selected_window_id=a["window_id"])
+        assert client.call("get_project_context")["project_id"] == imported["project_id"]
+        # An unselected client must never silently pick among multiple projects.
+        with pytest.raises(ValueError, match="Multiple windows"):
+            BridgeClient().start()
+        assert len(processes) == 2
+    finally:
         for process in processes:
             process.terminate()
             process.wait(timeout=15)

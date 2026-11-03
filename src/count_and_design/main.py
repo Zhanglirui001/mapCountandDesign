@@ -1,6 +1,7 @@
 """Application entry point."""
 
 import logging
+import os
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import sys
@@ -36,10 +37,11 @@ def main() -> int:
             raise ValueError("--codex-bridge requires a discovery JSON path")
         discovery = Path(sys.argv[index + 1]).resolve()
     elif getattr(sys, "frozen", False):
-        from .integration.runtime import bridge_file
-        discovery = bridge_file()
+        from .integration.runtime import bridge_file, new_bridge_file
+        discovery = bridge_file() if os.environ.get("COUNT_DESIGN_BRIDGE_FILE") else new_bridge_file()
 
-    # One bridged GUI per runtime directory, including concurrent MCP launches.
+    # Only an explicitly shared bridge is single-instance; each ordinary launch
+    # gets an independent bridge, project store and Qt process.
     instance_lock = None
     if discovery is not None:
         discovery.parent.mkdir(parents=True, exist_ok=True)
@@ -54,6 +56,10 @@ def main() -> int:
             return 0
 
     window = MainWindow()
+    if discovery is not None:
+        from .integration.runtime import window_id
+        window._mcp_window_id = window_id(discovery)
+        window.setWindowTitle(f"{window.windowTitle()} [{window_id(discovery)}]")
     window.show()
     if discovery is not None:
         from .integration.gui_bridge import GuiBridge
@@ -79,7 +85,7 @@ def _configure_logging() -> None:
     log_dir = Path(location or Path.cwd()) / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     handler = RotatingFileHandler(
-        log_dir / "count-and-design.log",
+        log_dir / f"count-and-design-{os.getpid()}.log",
         maxBytes=5 * 1024 * 1024,
         backupCount=3,
         encoding="utf-8",

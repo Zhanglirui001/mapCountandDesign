@@ -1,4 +1,5 @@
 {
+  "ai_statistics.queue.waiting": "W kolejce · zadań przed Tobą: {count}",
   "app.title": "Count and Design",
   "app.version": "Wersja 0.1.0",
   "app.about": "<h2>Count and Design</h2><p>Wersja 0.1.0</p><p>Aplikacja Qt do projektowania i obliczeń dla instalacji solarnych.</p>",

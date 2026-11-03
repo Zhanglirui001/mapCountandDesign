@@ -21,12 +21,12 @@ uv sync --extra mcp --dev
 uv run python -m count_and_design --codex-bridge .codex-runtime/bridge.json
 ```
 
-源码模式的默认桥接文件为项目目录下的 `.codex-runtime/bridge.json`，自动启动日志为 `.codex-runtime/app.log`，复核数据保存在 `.codex-runtime/projects`。
+MCP 自动创建的源码窗口使用项目目录下的 `.codex-runtime/windows/<实例目录>/bridge.json`，日志和 `projects` 数据也保存在各实例目录。上述手动命令则使用显式指定的 `.codex-runtime/bridge.json`。通过 `list_sessions` 和 `start_session(window_id=...)` 选择窗口，通过 `start_session(new_window=True)` 新建窗口。
 
 ## 测试与打包
 
 ```powershell
-uv run --extra mcp pytest tests/test_packaged_mcp_runtime.py tests/test_codex_integration.py
+uv run --extra mcp pytest tests/test_recognition_queue.py tests/test_packaged_mcp_runtime.py tests/test_codex_integration.py tests/test_ai_statistics_tab.py
 uv run pyinstaller count_and_design.spec --clean
 ```
 
@@ -34,4 +34,4 @@ uv run pyinstaller count_and_design.spec --clean
 
 Windows 无控制台打包会恢复 MCP 客户端继承的标准输入输出管道。打包规则还会优先使用当前 Python 自带的 OpenSSL DLL，避免误收集 PATH 中同名的 Conda 库。
 
-打包验收需额外检查：从不含源码的目录运行 EXE、MCP 握手和工具列表、自动启动 GUI、连接已双击打开的 GUI、PDF 导入与项目重连，以及重复启动时的窗口复用。离线测试不代表真实 OCR/LLM 服务准确率已通过验收。
+打包验收需额外检查：从不含源码的目录运行 EXE、MCP 握手和工具列表、自动启动 GUI、连接已双击打开的 GUI、多个窗口的 PDF/项目隔离与切换，以及 Agent3 跨窗口排队、独立取消和 Agent1/2 不被 Agent3 阻塞。Agent3 同时只运行一个，且只有工作线程和子进程真正结束才释放名额。离线测试不代表真实 OCR/LLM 服务准确率已通过验收。

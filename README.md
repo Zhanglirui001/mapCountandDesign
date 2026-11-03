@@ -117,6 +117,10 @@ uv run pyinstaller count_and_design.spec --clean
 
 打包后的 EXE 支持双击启动界面，以及通过 `--mcp` 启动内置 MCP 服务。
 Codex 可连接已打开的窗口，也可自动启动应用，无需源码或 Python 环境。
+通过 `start_session(new_window=True)` 可新建独立窗口，使用 `list_sessions` 和
+`start_session(window_id=...)` 切换项目。Agent1、Agent2 在各窗口独立运行；
+为限制内存叠加，Agent3 跨窗口共用 FIFO 队列，同时仅运行一个，其余显示排队。
+同一窗口同时仅运行一个阶段；支持取消等待或运行中的任务，且不取消其他窗口的任务。
 配置示例见 [打包版 MCP 配置](integrations/codex/mcp-config.packaged.example.toml)。
 
 正式发布由 GitLab CI 在 Windows Runner 上完成。

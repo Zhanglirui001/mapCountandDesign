@@ -9,6 +9,7 @@ gives the UI one reliable cancellation primitive: terminate that process.
 from __future__ import annotations
 
 import multiprocessing
+import os
 import threading
 import traceback
 from collections.abc import Callable
@@ -16,6 +17,8 @@ from dataclasses import replace
 from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any
+
+from ...recognition_queue import RecognitionWorkerLease
 
 from ..pdf_rendering import render_high_resolution_page
 from .service import (
@@ -34,6 +37,7 @@ from .contracts import (
 
 AGENT3_RENDER_MAX_SIDE = 6000
 _POLL_SECONDS = 0.02
+_worker_admission_guard: RecognitionWorkerLease | None = None
 
 
 class Agent3ProcessRunner:
@@ -71,6 +75,7 @@ class Agent3ProcessRunner:
         on_progress: Callable[[int, int], None] | None = None,
         on_step: Callable[[Agent3ProgressUpdate], None] | None = None,
         is_cancelled: Callable[[], bool] | None = None,
+        admission: tuple[str, str] | None = None,
     ) -> tuple[ElementRecognitionResult, dict[int, bytes]]:
         """Run Agent3 in a spawned process and relay only progress/result data."""
 
@@ -80,8 +85,8 @@ class Agent3ProcessRunner:
         context = multiprocessing.get_context("spawn")
         receive, send = context.Pipe(duplex=False)
         process = context.Process(
-            target=self._process_target,
-            args=(request, str(pdf_path), cached_images, send),
+            target=_guarded_agent3_process,
+            args=(self._process_target, request, str(pdf_path), cached_images, send, admission),
             name="agent3-model-process",
         )
         try:
@@ -177,6 +182,33 @@ class Agent3ProcessRunner:
             if self._process is process:
                 self._process = None
         process.close()
+
+
+def _guarded_agent3_process(target, request, pdf_path, cached_images, connection, admission):
+    """Watch the spawning parent and retain admission until actual process exit."""
+    parent = multiprocessing.parent_process()
+    if parent is None:
+        raise RuntimeError("Agent3 requires a spawning parent")
+
+    def stop_with_parent():
+        parent.join()
+        os._exit(1)  # Interrupt blocking HTTP/native work; OS releases the lease.
+
+    threading.Thread(target=stop_with_parent, name="agent3-parent-watch", daemon=True).start()
+    global _worker_admission_guard
+    try:
+        if admission is not None:
+            # Retain this process-local reference through Python shutdown.
+            # Only actual process termination releases its OS file lock.
+            _worker_admission_guard = RecognitionWorkerLease(admission)
+        target(request, pdf_path, cached_images, connection)
+    except BaseException as exc:
+        try:
+            connection.send(("error", type(exc).__name__, str(exc), traceback.format_exc()))
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+    finally:
+        connection.close()
 
 
 def _agent3_process_main(

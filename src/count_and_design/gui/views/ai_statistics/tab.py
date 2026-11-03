@@ -716,7 +716,7 @@ class AIStatisticsTab(QWidget):
         )
         self._agent3_progress.setVisible(state.element_running)
         self._cancel_ai_button.setVisible(ai_running)
-        if state.element_running:
+        if state.element_running and not state.recognition_queued:
             if self._agent3_started_at is None:
                 self._agent3_started_at = monotonic()
                 self._agent3_elapsed_timer.start()
@@ -731,11 +731,19 @@ class AIStatisticsTab(QWidget):
             self._agent1_progress.setRange(0, total)
             self._agent1_progress.setValue(state.progress_completed)
         if state.information_recognition_running:
+            self._agent2_progress.setFormat("Agent2 %v/%m")
             total = max(1, state.information_progress_total)
             self._agent2_progress.setRange(0, total)
             self._agent2_progress.setValue(
                 state.information_progress_completed
             )
+        if state.recognition_queued:
+            label = tr("ai_statistics.queue.waiting", "Queued · {count} task(s) ahead").format(
+                count=state.queue_position)
+            for progress in (self._agent1_progress, self._agent2_progress, self._agent3_progress):
+                progress.setRange(0, 1)
+                progress.setValue(0)
+                progress.setFormat(label)
         for index, page in enumerate(self.pages[:3]):
             enabled = state.confirm_enabled[index]
             if index == self._INFO_RECOGNITION_STAGE:
@@ -748,6 +756,12 @@ class AIStatisticsTab(QWidget):
     def _update_agent3_progress_bar(self) -> None:
         state = self._view_model.state
         if not state.element_running:
+            return
+        if state.recognition_queued:
+            self._agent3_progress.setRange(0, 1)
+            self._agent3_progress.setValue(0)
+            self._agent3_progress.setFormat(
+                tr("ai_statistics.queue.waiting", "Queued · {count} task(s) ahead").format(count=state.queue_position))
             return
         labels = {
             "rendering": tr(

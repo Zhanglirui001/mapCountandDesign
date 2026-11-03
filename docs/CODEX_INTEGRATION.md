@@ -70,9 +70,33 @@ Codex 根据配置启动 MCP 服务；注册 MCP 本身不会立即打开桌面�
 
 > 请调用 count-and-design 的 start_session，连接或启动 Count and Design，并告诉我是否连接成功。
 
-成功时，工具返回包含 `project_id`、`revision`、`page_count` 等字段的状态；应用窗口打开，或复用已打开的打包版窗口。重复启动使用同一个桥接路径的 EXE 不会再创建一个项目窗口。
+成功时，工具返回包含 `window_id`、`project_id`、`revision`、`page_count` 等字段的状态。没有选中窗口时，`start_session()` 连接唯一已打开的窗口，或在没有窗口时新建一个；已有多个窗口时，必须明确选择。选中窗口后，重复调用会复用该窗口。
 
 应以实际工具调用及返回结果为准，仅回复“可以启动”或输出命令不能证明接入成功。
+
+## 多窗口与识别队列
+
+每次普通双击 EXE 都会新开一个独立窗口。每个窗口拥有独立的桥接地址、认证令牌、项目状态和复核数据；窗口标题显示 `window_id`，便于区分。
+
+同一个 Codex 会话可使用以下工具管理窗口：
+
+| 调用 | 行为 |
+| --- | --- |
+| `start_session(new_window=True)` | 新建独立窗口，并将后续工具调用指向该窗口 |
+| `list_sessions()` | 列出当前可连接窗口的 ID、项目/PDF 状态和当前选择 |
+| `start_session(window_id="列表中的 ID")` | 切换到指定窗口，后续导入、识别和修正均针对该窗口 |
+| `start_session()` | 复用本 MCP 会话已选窗口；首次连接存在多个窗口时要求明确选择 |
+| `cancel_recognition()` | 取消当前所选窗口中排队或运行的识别阶段 |
+
+例如可以告诉 Codex：“新建两个独立窗口，分别导入 A.pdf 和 B.pdf，并依次提交识别。”Codex 应记住每份图纸对应的 `window_id`，切换后核对 `project_id`，再继续操作。预览和提交修正期间应保持选中同一窗口。
+
+Agent1、Agent2 在各窗口独立运行。为限制内存叠加，Agent3 跨窗口共用 FIFO 队列，同时只运行一个，其余等待。窗口一运行 Agent3 时，窗口二仍可立即运行 Agent1 或 Agent2；窗口二提交的 Agent3 则显示排队。同一窗口同时只运行一个阶段。一个任务是当前 PDF 的一个阶段；阶段内部仍按现有规则处理多页。界面按钮和 MCP 调用遵循相同规则。
+
+`start_recognition` 接受请求后立即返回 `job_id`，通过 `get_job_status(job_id=...)` 查询。`job.status` 区分 `queued`、`running`、`completed`、`failed` 和 `cancelled`；`queue_position` 表示当前阶段所属队列的前方任务数，运行时为 0。Agent3 的前方任务可以来自其他窗口，Agent1/2 不受该共享队列影响。取消按钮可移除等待中的任务。
+
+运行任务完成、失败或取消且工作线程实际停止后才释放名额；关闭等待窗口会移除其排队任务。进程异常退出留下的失效队列项会在后续调度时清理。Codex 看图、复核和修正不占识别名额。等待期间不能替换该窗口的 PDF；可取消等待，或切换到其他独立窗口操作。
+
+Agent3 子进程会监测主窗口进程的退出，并持有独立的任务租约；即使主窗口崩溃，子进程实际退出前仍不会放行下一任务。数据库暂时被占用时，等待中的任务会保留位置并自动重试，取消操作不依赖数据库写锁。排队期间可以浏览已开放阶段，任务开始时自动切回原来提交的识别阶段。
 
 ## 接入成功后，如何开始识别
 
@@ -88,7 +112,7 @@ Codex 根据配置启动 MCP 服务；注册 MCP 本身不会立即打开桌面�
 
 > 请使用 count-and-design 工具导入 `C:\drawings\project.pdf`，执行识别，然后查看疑点原图并修正证据明确的错误。不要为了让数量相等而强行补框，最后给出修改摘要和剩余问题。
 
-不必自己输入 `import_pdf`、`preview_corrections` 等 JSON 参数，Codex 会根据工具说明调用。导入新的 PDF 会替换应用当前的识别草稿；如果需要保留当前结果，应先完成导出。
+不必自己输入 `import_pdf`、`preview_corrections` 等 JSON 参数，Codex 会根据工具说明调用。要求另开或导入新项目时，Codex 应先调用 `start_session(new_window=True)`，保留已有窗口。`import_pdf` 默认拒绝覆盖已导入的 PDF，即使尚未开始识别；只有明确要求替换当前图纸时才传入 `replace_existing=True`。同一路径重复导入也受此保护。
 
 若已知连接方向，可以补充“连接方向为 P-N”等项目信息。未提供方向时，工具保留 unknown，并在摘要中提示极性/偏移解释仍需复核。
 
@@ -117,22 +141,25 @@ C:\Users\LiruiZhang\.codex\skills\count-design-review\SKILL.md
 | 仍提示 Python 或模块不存在 | Codex 仍在使用旧的源码配置；按第 3 步替换配置，重启 Codex 并新开会话。打包版无需安装 Python。 |
 | Codex 找不到 `start_session` | 检查是否编辑了实际使用的用户配置，以及配置是否保存、Codex 是否完全重启。 |
 | MCP 已连接，但应用未启动 | 让 Codex 实际调用 `start_session`。只有 MCP 握手不会打开应用窗口。 |
-| `start_session` 报启动失败 | 查看 `%LOCALAPPDATA%\CountAndDesign\runtime\app.log`；双击启动的应用不一定生成该文件。 |
+| `start_session` 报启动失败 | 查看 `%LOCALAPPDATA%\CountAndDesign\runtime\windows\<实例目录>\app.log`，或工具错误中给出的完整日志路径；双击启动的应用不一定生成该文件。 |
 | 窗口打开了，但识别失败 | 查询 `get_job_status` 的具体错误，再检查应用服务配置、本地模型和 OCR/LLM/Embedding 连接。 |
-| 已有窗口，但 Codex 连接了另一个实例 | 确认打开的是新版打包 EXE；检查双方是否使用同一 Windows 用户及相同的 `COUNT_DESIGN_BRIDGE_FILE`。源码启动的普通窗口不属于打包版默认桥接。 |
+| 已有多个窗口，提示选择窗口 | 调用 `list_sessions`，核对 PDF 与项目后，使用 `start_session(window_id=...)` 选择。 |
+| 某个窗口一直显示排队 | 查询该窗口的 `get_job_status`。前方阶段结束后会自动开始；如需放弃，调用 `cancel_recognition` 或在该窗口点击取消。 |
 | 手动修改后出现 revision 冲突 | 让 Codex 重新读取当前证据并生成修正预览。 |
 
 不要在普通终端用 `--mcp` 检查窗口是否出现：该模式等待 MCP 客户端的 STDIO 消息。日常打开界面直接双击即可，完整接入按第 5 步验证。
 
 ## 运行数据与更新
 
-Windows 打包版默认运行目录是 `%LOCALAPPDATA%\CountAndDesign\runtime`：
+Windows 打包版每个窗口默认使用 `%LOCALAPPDATA%\CountAndDesign\runtime\windows\<实例目录>`：
 
 - `bridge.json`：本地桥接地址、进程 ID 和认证令牌，正常关闭应用时删除。
 - `app.log`：由 MCP 自动启动桌面应用时记录的标准输出及错误日志。
 - `projects/<project_id>`：复核结果、证据和修正审计；应用关闭后仍保留。
 
-运行数据保存在用户目录，支持将 EXE 放在不允许普通用户写入的安装目录。需要隔离多个实例时，可为 GUI 和 MCP 进程设置相同的 `COUNT_DESIGN_BRIDGE_FILE` 绝对路径。
+运行数据保存在用户目录，支持将 EXE 放在不允许普通用户写入的安装目录。Agent1/2 识别租约保存在 `%LOCALAPPDATA%\CountAndDesign\recognition-queue\windows` 下的各窗口子目录；Agent3 使用同一根目录下的 `agent3` 共享队列。
+
+通常无需设置环境变量。开发调试时可使用 `COUNT_DESIGN_BRIDGE_FILE` 固定某个桥接路径：相同路径仍只对应一个窗口。`COUNT_DESIGN_QUEUE_DIR` 可覆盖识别租约的根目录；使用同一根目录的窗口共用 Agent3 队列，Agent1/2 仍使用独立子目录。普通使用应保留默认值。所有窗口须使用更新后的程序；旧版无限制并行窗口不受新队列管理。
 
 更新 EXE 前先导出需要保留的识别结果，再关闭旧应用及对应 MCP 会话。替换文件后检查 `command` 路径并重启 Codex。当前识别草稿不会在重启后自动恢复，审计文件保留不等于界面会自动恢复项目。
 
@@ -142,7 +169,7 @@ Windows 打包版默认运行目录是 `%LOCALAPPDATA%\CountAndDesign\runtime`�
 
 ## 开发参考：一次完整工具调用
 
-本阶段提供 12 个 MCP 工具，新增 `preview_stage_corrections`（Agent1/2 修正预览）和 `confirm_stage_review`（Codex 核验完成关卡）。下面的参数示例供开发和排查使用，普通用户可以直接通过上面的自然语言提示词操作。
+当前提供 14 个 MCP 工具，包含窗口列表、识别取消，以及识别与复核工具。下面的参数示例供开发和排查使用，普通用户可以直接通过上面的自然语言提示词操作。
 
 1. `start_session()`：连接已有桥接实例或启动带界面的实例。
 2. 在应用上传 PDF，或 `import_pdf(path="绝对路径")`。
@@ -203,7 +230,7 @@ Windows 打包版默认运行目录是 `%LOCALAPPDATA%\CountAndDesign\runtime`�
 ## 状态与一致性
 
 - 桌面应用是项目状态唯一持有者。MCP 是 STDIO 适配器，通过带随机令牌的 127.0.0.1 HTTP 桥接排队调用 Qt 主线程。
-- 打包 EXE 默认开启桥接，双击与 MCP 启动共享窗口；源码环境仍仅在 `--codex-bridge <discovery.json>` 下开启。源码启动与调试方式见单独的源码开发接入说明。
+- 打包 EXE 默认开启桥接，每次普通双击创建独立窗口；MCP 可选择已有窗口或新建窗口。显式指定同一桥接文件时复用对应窗口。源码环境仍在 `--codex-bridge <discovery.json>` 下开启；调试方式见单独的源码开发接入说明。
 - 用户手动上传和修改结果仍通过原 ViewModel。项目结果、分类或识别设置变化会使旧 revision/preview/evidence 失效；纯进度更新不会。识别与上传期间拒绝纠错写入。
 - 只有几何输入或匹配表格串数发生变化的 Node 才重建几何；同页其他 Node 和仅修改 INV 名称时的 Row 结构保留。目标 Node 的几何编辑仍可能替换其手工 Row，必须查看预览。
 - 修正预览和提交回执提供 `issue_changes`（消失、仍存、新增的问题记录）和 `repair_checks`（检测 Tracker 数、结构 Tracker 数、逐 Node 差异、校验状态与阻塞原因）。提交回执还提供 `preview_matches_published`，根据界面实际发布结果复核。问题记录消失不等于视觉正确；总数量接近不代表逐 Node 已正确。
@@ -213,7 +240,7 @@ Windows 打包版默认运行目录是 `%LOCALAPPDATA%\CountAndDesign\runtime`�
 - 如果节点同时未出现在表格和检测结果里，仅靠表格对账无法发现；需结合具体区域的原图、未归属 Tracker/Box 或人工线索继续定位，不默认全图重查。
 - `get_review_summary` 额外导出 `manual-review.json` 并返回 `manual_review_path`，包含 PDF 路径、页码、缺失 Node 候选及显式人工待确认项，便于后续人工接手。候选项不计入正式设备数量；问题列表与导出汇总都会反映这些未解决项。
 - 修正操作不直接修改生产 Count 项目；先更新 AI Statistics 的识别草稿。原有确认/校验/导入 Count 流程继续可用。
-- 每次提交保存 before/after 审计 JSON，界面通过 `replace_element_result` 的 state_changed 信号立即刷新。打包版默认保存在 `%LOCALAPPDATA%\CountAndDesign\runtime\projects/<project_id>`；源码版默认保存在项目的 `.codex-runtime/projects/<project_id>`（已加入 Git 忽略）。自定义桥接路径时，数据保存在桥接文件同级的 `projects` 目录；应用关闭后仍保留。
+- 每次提交保存 before/after 审计 JSON，界面通过 `replace_element_result` 的 state_changed 信号立即刷新。数据保存在各窗口桥接文件同级的 `projects/<project_id>` 目录；应用关闭后仍保留。源码运行目录 `.codex-runtime` 已加入 Git 忽略。
 - request_id 在当前应用会话内幂等。重试完全相同的请求返回原回执；同 ID 不同请求会被拒绝。
 
 ## 坐标与证据
@@ -236,7 +263,7 @@ Windows 打包版默认运行目录是 `%LOCALAPPDATA%\CountAndDesign\runtime`�
 以下命令仅供源码开发环境使用；打包版接入按前文第 5 步验证。
 
 ```powershell
-uv run --extra mcp pytest tests/test_packaged_mcp_runtime.py tests/test_codex_integration.py
+uv run --extra mcp pytest tests/test_recognition_queue.py tests/test_agent3_process_cancellation.py tests/test_packaged_mcp_runtime.py tests/test_codex_integration.py tests/test_ai_statistics_tab.py tests/test_main_window_controllers.py
 ```
 
 测试使用生成的 PDF 和离线识别草稿，验证真实几何重算、Agent4 数量、原图/叠加图、Qt 界面同步、本地 HTTP 调用、MCP 工具 schema 与原生图片、非法操作原子拒绝、版本冲突和幂等提交。真实模型/远程服务准确率还需要用实际项目 PDF 另外验收。
